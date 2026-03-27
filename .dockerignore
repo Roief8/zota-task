@@ -1,0 +1,15 @@
+.git
+.github
+infra
+assets
+
+*.md
+*.doc
+*.docx
+*.zip
+
+.env
+.env.*
+
+coverage.*
+*.out
