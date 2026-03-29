@@ -183,6 +183,11 @@ Resources:
                   - lambda:*
                   - logs:*
                 Resource: "*"
+              - Sid: ReadLambdaExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                Resource: !GetAtt LambdaExecutionRole.Arn
               - Sid: PassLambdaExecutionRole
                 Effect: Allow
                 Action:
