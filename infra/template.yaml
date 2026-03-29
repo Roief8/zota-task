@@ -421,9 +421,9 @@ Outputs:
     Description: ECR repository URI used by the CI build job
     Value: !GetAtt ProxyImageRepository.RepositoryUri
 
-  EcrRepositoryName:
-    Description: ECR repository name used by the CI build job
-    Value: !Ref ProxyImageRepository
+  GitHubActionsRoleArn:
+    Description: IAM role assumed by GitHub Actions through OIDC
+    Value: !GetAtt GitHubActionsRole.Arn
 
   CloudFormationExecutionRoleArn:
     Description: IAM role passed to CloudFormation during automated deployments

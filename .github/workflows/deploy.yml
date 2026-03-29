@@ -1,0 +1,143 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows:
+      - build
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download image metadata artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image-metadata
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: artifact
+
+      - name: Parse image metadata
+        id: metadata
+        run: |
+          metadata_file="artifact/image-metadata.json"
+
+          for key in repository_uri image_digest stack_name environment_name aws_region; do
+            value="$(jq -r ".${key}" "${metadata_file}")"
+
+            if [[ -z "${value}" || "${value}" == "null" ]]; then
+              echo "Missing ${key} in ${metadata_file}" >&2
+              exit 1
+            fi
+
+            echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Validate deploy configuration
+        run: |
+          if [[ -z "${{ vars.AWS_ROLE_TO_ASSUME }}" ]]; then
+            echo "Missing repository variable AWS_ROLE_TO_ASSUME" >&2
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ steps.metadata.outputs.aws_region }}
+
+      - name: Resolve CloudFormation execution role
+        id: cfn_role
+        run: |
+          stderr_file="$(mktemp)"
+          stack_outputs="$(aws cloudformation describe-stacks \
+            --stack-name "${{ steps.metadata.outputs.stack_name }}" \
+            --query 'Stacks[0].Outputs' \
+            --output json 2>"${stderr_file}")" || {
+            if grep -qi 'does not exist' "${stderr_file}"; then
+              echo "Stack ${{ steps.metadata.outputs.stack_name }} does not exist. Run the initial bootstrap deployment manually before using this workflow." >&2
+            else
+              cat "${stderr_file}" >&2
+            fi
+            exit 1
+          }
+
+          role_arn="$(jq -r '.[] | select(.OutputKey=="CloudFormationExecutionRoleArn") | .OutputValue' <<<"${stack_outputs}")"
+
+          if [[ -z "${role_arn}" || "${role_arn}" == "None" ]]; then
+            echo "Stack ${{ steps.metadata.outputs.stack_name }} does not expose CloudFormationExecutionRoleArn" >&2
+            exit 1
+          fi
+
+          echo "role_arn=${role_arn}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy stack
+        env:
+          IMAGE_URI: ${{ steps.metadata.outputs.repository_uri }}@${{ steps.metadata.outputs.image_digest }}
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/template.yaml \
+            --stack-name "${{ steps.metadata.outputs.stack_name }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              EnvironmentName="${{ steps.metadata.outputs.environment_name }}" \
+              ImageUri="${IMAGE_URI}" \
+              GitHubRepository="${{ github.repository }}" \
+              GitHubBranch="${{ github.event.workflow_run.head_branch }}" \
+            --role-arn "${{ steps.cfn_role.outputs.role_arn }}" \
+            --region "${{ steps.metadata.outputs.aws_region }}"
+
+      - name: Resolve deployment outputs
+        id: stack_outputs
+        run: |
+          stderr_file="$(mktemp)"
+          stack_outputs_json="$(aws cloudformation describe-stacks \
+            --stack-name "${{ steps.metadata.outputs.stack_name }}" \
+            --query 'Stacks[0].Outputs' \
+            --output json 2>"${stderr_file}")" || {
+            if grep -qi 'does not exist' "${stderr_file}"; then
+              echo "Stack ${{ steps.metadata.outputs.stack_name }} does not exist after deployment." >&2
+            else
+              cat "${stderr_file}" >&2
+            fi
+            exit 1
+          }
+
+          cloudfront_url="$(jq -r '.[] | select(.OutputKey=="CloudFrontUrl") | .OutputValue' <<<"${stack_outputs_json}")"
+
+          if [[ -z "${cloudfront_url}" || "${cloudfront_url}" == "None" ]]; then
+            echo "Stack ${{ steps.metadata.outputs.stack_name }} does not expose CloudFrontUrl" >&2
+            exit 1
+          fi
+
+          echo "cloudfront_url=${cloudfront_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "## Deployment completed"
+            echo
+            echo "- Stack: \`${{ steps.metadata.outputs.stack_name }}\`"
+            echo "- Environment: \`${{ steps.metadata.outputs.environment_name }}\`"
+            echo "- Image: \`${{ steps.metadata.outputs.repository_uri }}@${{ steps.metadata.outputs.image_digest }}\`"
+            echo "- CloudFront URL: ${{ steps.stack_outputs.outputs.cloudfront_url }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,197 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  STACK_NAME: ${{ vars.STACK_NAME }}
+  ENVIRONMENT_NAME: ${{ vars.ENVIRONMENT_NAME }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate publish configuration
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          missing=()
+
+          for name in AWS_REGION STACK_NAME ENVIRONMENT_NAME; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("${name}")
+            fi
+          done
+
+          if [[ -z "${{ vars.AWS_ROLE_TO_ASSUME }}" ]]; then
+            missing+=("AWS_ROLE_TO_ASSUME")
+          fi
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing repository variables: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve ECR repository
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        id: ecr
+        run: |
+          stderr_file="$(mktemp)"
+          stack_outputs="$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query 'Stacks[0].Outputs' \
+            --output json 2>"${stderr_file}")" || {
+            if grep -qi 'does not exist' "${stderr_file}"; then
+              echo "Stack ${STACK_NAME} does not exist. Run the initial bootstrap deployment manually before using this workflow." >&2
+            else
+              cat "${stderr_file}" >&2
+            fi
+            exit 1
+          }
+
+          repository_uri="$(jq -r '.[] | select(.OutputKey=="EcrRepositoryUri") | .OutputValue' <<<"${stack_outputs}")"
+
+          if [[ -z "${repository_uri}" || "${repository_uri}" == "None" ]]; then
+            echo "Stack ${STACK_NAME} does not expose EcrRepositoryUri" >&2
+            exit 1
+          fi
+
+          echo "repository_uri=${repository_uri}" >> "$GITHUB_OUTPUT"
+          echo "repository_name=${repository_uri#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Amazon ECR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check whether image tag already exists
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        id: existing_image
+        run: |
+          stderr_file="$(mktemp)"
+
+          if image_digest="$(aws ecr describe-images \
+            --repository-name "${{ steps.ecr.outputs.repository_name }}" \
+            --image-ids imageTag="${{ github.sha }}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>"${stderr_file}")"; then
+            if [[ -n "${image_digest}" && "${image_digest}" != "None" ]]; then
+              echo "image_exists=true" >> "$GITHUB_OUTPUT"
+              echo "image_digest=${image_digest}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if grep -q 'ImageNotFoundException' "${stderr_file}"; then
+            echo "image_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cat "${stderr_file}" >&2
+          exit 1
+
+      - name: Build image for validation
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --provenance=false \
+            .
+
+      - name: Build and push image
+        if: (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') && steps.existing_image.outputs.image_exists != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --provenance=false \
+            --push \
+            --tag "${{ steps.ecr.outputs.repository_uri }}:${{ github.sha }}" \
+            .
+
+      - name: Resolve pushed image digest
+        if: (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') && steps.existing_image.outputs.image_exists != 'true'
+        id: pushed_image
+        run: |
+          image_digest="$(aws ecr describe-images \
+            --repository-name "${{ steps.ecr.outputs.repository_name }}" \
+            --image-ids imageTag="${{ github.sha }}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          if [[ -z "${image_digest}" || "${image_digest}" == "None" ]]; then
+            echo "Unable to resolve image digest for tag ${{ github.sha }}" >&2
+            exit 1
+          fi
+
+          echo "image_digest=${image_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Select image digest
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        id: digest
+        run: |
+          image_digest="${{ steps.existing_image.outputs.image_digest }}"
+
+          if [[ -z "${image_digest}" ]]; then
+            image_digest="${{ steps.pushed_image.outputs.image_digest }}"
+          fi
+
+          if [[ -z "${image_digest}" ]]; then
+            echo "Unable to resolve image digest for deployment metadata" >&2
+            exit 1
+          fi
+
+          echo "image_digest=${image_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Write image metadata
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          cat > image-metadata.json <<EOF
+          {
+            "repository_uri": "${{ steps.ecr.outputs.repository_uri }}",
+            "image_digest": "${{ steps.digest.outputs.image_digest }}",
+            "stack_name": "${STACK_NAME}",
+            "environment_name": "${ENVIRONMENT_NAME}",
+            "aws_region": "${AWS_REGION}"
+          }
+          EOF
+
+      - name: Upload image metadata artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-metadata
+          path: image-metadata.json
+          if-no-files-found: error
+          retention-days: 1
