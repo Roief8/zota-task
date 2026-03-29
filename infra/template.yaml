@@ -1,9 +1,9 @@
-AWSTemplateFormatVersion: '2010-09-09'
+AWSTemplateFormatVersion: "2010-09-09"
 Description: Secure serverless asset proxy skeleton for the Zota task
 
 # First deployment:
 # - leave ImageUri empty
-# - create the shared base resources (ECR, S3, IAM)
+# - create the shared base resources (ECR, S3, IAM, GitHub OIDC)
 # Second deployment:
 # - pass an immutable image URI
 # - create the Lambda function, log group, Function URL, and CloudFront resources
@@ -14,22 +14,37 @@ Parameters:
     Default: dev
     MinLength: 2
     MaxLength: 10
-    AllowedPattern: '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$'
+    AllowedPattern: "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
     ConstraintDescription: Must start and end with a lowercase letter or number and may contain hyphens in the middle
     Description: Lowercase environment name used in resource names
 
   ImageUri:
     Type: String
-    Default: ''
-    AllowedPattern: '^$|^.+@sha256:[A-Fa-f0-9]{64}$'
+    Default: ""
+    AllowedPattern: "^$|^.+@sha256:[A-Fa-f0-9]{64}$"
     ConstraintDescription: Must be empty for the first deployment or use an immutable image reference with an @sha256 digest
     Description: Immutable container image URI for the Lambda function
+
+  GitHubRepository:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    ConstraintDescription: Must use the owner/repository format
+    Description: GitHub repository allowed to assume the CI role, for example octo-org/octo-repo
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: "^[A-Za-z0-9._/-]+$"
+    ConstraintDescription: Must be a valid Git branch name or branch path
+    Description: Git branch allowed to assume the CI role through GitHub OIDC
 
 Conditions:
   HasImageUri: !Not
     - !Equals
       - !Ref ImageUri
-      - ''
+      - ""
 
 Resources:
   ProxyImageRepository:
@@ -37,7 +52,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      RepositoryName: !Sub 'zota-${EnvironmentName}-proxy'
+      RepositoryName: !Sub "zota-${EnvironmentName}-proxy"
       EncryptionConfiguration:
         EncryptionType: AES256
       ImageScanningConfiguration:
@@ -62,7 +77,7 @@ Resources:
             ]
           }
       RepositoryPolicyText:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Sid: AllowLambdaImageRetrieval
             Effect: Allow
@@ -73,7 +88,7 @@ Resources:
               - ecr:GetDownloadUrlForLayer
             Condition:
               StringLike:
-                aws:sourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:zota-${EnvironmentName}-proxy'
+                aws:sourceArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:zota-${EnvironmentName}-proxy"
       Tags:
         - Key: Project
           Value: zota
@@ -85,7 +100,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      BucketName: !Sub 'zota-${EnvironmentName}-assets-${AWS::AccountId}-${AWS::Region}'
+      BucketName: !Sub "zota-${EnvironmentName}-assets-${AWS::AccountId}-${AWS::Region}"
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -108,24 +123,151 @@ Resources:
     Properties:
       Bucket: !Ref AssetsBucket
       PolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Sid: DenyInsecureTransport
             Effect: Deny
-            Principal: '*'
-            Action: 's3:*'
+            Principal: "*"
+            Action: "s3:*"
             Resource:
               - !GetAtt AssetsBucket.Arn
-              - !Sub '${AssetsBucket.Arn}/*'
+              - !Sub "${AssetsBucket.Arn}/*"
             Condition:
               Bool:
-                aws:SecureTransport: 'false'
+                aws:SecureTransport: "false"
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: zota
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "zota-${EnvironmentName}-cloudformation-exec"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ManageZotaStackResources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ManageApplicationResources
+                Effect: Allow
+                Action:
+                  - cloudfront:*
+                  - ecr:*
+                  - lambda:*
+                  - logs:*
+                  - s3:*
+                Resource: "*"
+              - Sid: ManageApplicationIdentity
+                Effect: Allow
+                Action:
+                  - iam:AddClientIDToOpenIDConnectProvider
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:CreateRole
+                  - iam:DeleteOpenIDConnectProvider
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetOpenIDConnectProvider
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:RemoveClientIDFromOpenIDConnectProvider
+                  - iam:TagOpenIDConnectProvider
+                  - iam:TagRole
+                  - iam:UntagOpenIDConnectProvider
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:UpdateOpenIDConnectProviderThumbprint
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: zota
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "zota-${EnvironmentName}-github-actions"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: BuildAndDeployProxy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ManageCloudFormationDeployments
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+              - Sid: PushImmutableImages
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushImagesToProxyRepository
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ProxyImageRepository.Arn
+              - Sid: PassCloudFormationExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+      Tags:
+        - Key: Project
+          Value: zota
+        - Key: Environment
+          Value: !Ref EnvironmentName
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -134,23 +276,23 @@ Resources:
       Policies:
         - PolicyName: ReadAssetsBucket
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Sid: ReadPrivateAssets
                 Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: !Sub '${AssetsBucket.Arn}/*'
+                Resource: !Sub "${AssetsBucket.Arn}/*"
         - PolicyName: WriteFunctionLogs
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Sid: WriteProxyLogs
                 Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/zota-${EnvironmentName}-proxy:*'
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/zota-${EnvironmentName}-proxy:*"
       Tags:
         - Key: Project
           Value: zota
@@ -161,7 +303,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Condition: HasImageUri
     Properties:
-      LogGroupName: !Sub '/aws/lambda/zota-${EnvironmentName}-proxy'
+      LogGroupName: !Sub "/aws/lambda/zota-${EnvironmentName}-proxy"
       RetentionInDays: 14
       Tags:
         - Key: Project
@@ -175,7 +317,7 @@ Resources:
     DependsOn:
       - LambdaLogGroup
     Properties:
-      FunctionName: !Sub 'zota-${EnvironmentName}-proxy'
+      FunctionName: !Sub "zota-${EnvironmentName}-proxy"
       PackageType: Image
       Role: !GetAtt LambdaExecutionRole.Arn
       Architectures:
@@ -206,8 +348,8 @@ Resources:
     Condition: HasImageUri
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub 'zota-${EnvironmentName}-lambda-url-oac'
-        Description: !Sub 'OAC for zota-${EnvironmentName} Lambda Function URL'
+        Name: !Sub "zota-${EnvironmentName}-lambda-url-oac"
+        Description: !Sub "OAC for zota-${EnvironmentName} Lambda Function URL"
         OriginAccessControlOriginType: lambda
         SigningBehavior: always
         SigningProtocol: sigv4
@@ -218,7 +360,7 @@ Resources:
     Properties:
       DistributionConfig:
         Enabled: true
-        Comment: !Sub 'zota-${EnvironmentName} secure asset proxy'
+        Comment: !Sub "zota-${EnvironmentName} secure asset proxy"
         HttpVersion: http2
         IPV6Enabled: true
         PriceClass: PriceClass_100
@@ -262,7 +404,7 @@ Resources:
       FunctionName: !Ref ProxyFunction
       FunctionUrlAuthType: AWS_IAM
       Principal: cloudfront.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+      SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
 
   InvokeFunctionPermission:
     Type: AWS::Lambda::Permission
@@ -272,12 +414,20 @@ Resources:
       FunctionName: !Ref ProxyFunction
       InvokedViaFunctionUrl: true
       Principal: cloudfront.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+      SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
 
 Outputs:
   EcrRepositoryUri:
     Description: ECR repository URI used by the CI build job
     Value: !GetAtt ProxyImageRepository.RepositoryUri
+
+  EcrRepositoryName:
+    Description: ECR repository name used by the CI build job
+    Value: !Ref ProxyImageRepository
+
+  CloudFormationExecutionRoleArn:
+    Description: IAM role passed to CloudFormation during automated deployments
+    Value: !GetAtt CloudFormationExecutionRole.Arn
 
   BucketName:
     Description: Private S3 bucket used to store the assets
@@ -291,4 +441,4 @@ Outputs:
   CloudFrontUrl:
     Condition: HasImageUri
     Description: Public URL served through CloudFront
-    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
