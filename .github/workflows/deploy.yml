@@ -64,31 +64,6 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ steps.metadata.outputs.aws_region }}
 
-      - name: Resolve CloudFormation execution role
-        id: cfn_role
-        run: |
-          stderr_file="$(mktemp)"
-          stack_outputs="$(aws cloudformation describe-stacks \
-            --stack-name "${{ steps.metadata.outputs.stack_name }}" \
-            --query 'Stacks[0].Outputs' \
-            --output json 2>"${stderr_file}")" || {
-            if grep -qi 'does not exist' "${stderr_file}"; then
-              echo "Stack ${{ steps.metadata.outputs.stack_name }} does not exist. Run the initial bootstrap deployment manually before using this workflow." >&2
-            else
-              cat "${stderr_file}" >&2
-            fi
-            exit 1
-          }
-
-          role_arn="$(jq -r '.[] | select(.OutputKey=="CloudFormationExecutionRoleArn") | .OutputValue' <<<"${stack_outputs}")"
-
-          if [[ -z "${role_arn}" || "${role_arn}" == "None" ]]; then
-            echo "Stack ${{ steps.metadata.outputs.stack_name }} does not expose CloudFormationExecutionRoleArn" >&2
-            exit 1
-          fi
-
-          echo "role_arn=${role_arn}" >> "$GITHUB_OUTPUT"
-
       - name: Deploy stack
         env:
           IMAGE_URI: ${{ steps.metadata.outputs.repository_uri }}@${{ steps.metadata.outputs.image_digest }}
@@ -103,7 +78,6 @@ jobs:
               ImageUri="${IMAGE_URI}" \
               GitHubRepository="${{ github.repository }}" \
               GitHubBranch="${{ github.event.workflow_run.head_branch }}" \
-            --role-arn "${{ steps.cfn_role.outputs.role_arn }}" \
             --region "${{ steps.metadata.outputs.aws_region }}"
 
       - name: Resolve deployment outputs
